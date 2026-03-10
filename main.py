@@ -3,6 +3,10 @@ import gpxpy
 import pandas as pd
 import plotly.express as px
 import numpy as np
+from fpdf import FPDF
+
+# Must be called first
+st.set_page_config(page_title="Workout Analyzer", layout="wide")
 
 # --- Helper Function: Format decimal minutes to MM:SS ---
 def format_time(decimal_minutes):
@@ -14,6 +18,50 @@ def format_time(decimal_minutes):
         mins += 1
         secs = 0
     return f"{mins}:{secs:02d}"
+
+# --- Helper Function: Generate PDF Report ---
+def generate_pdf_report(activity_type, summary_df, detailed_dfs):
+    class PDF(FPDF):
+        def header(self):
+            self.set_font('Arial', 'B', 15)
+            self.cell(0, 10, f'GPX {activity_type} Workout Report', 0, 1, 'C')
+            self.ln(5)
+
+    pdf = PDF()
+    pdf.add_page()
+    
+    def add_table_to_pdf(df, title):
+        pdf.set_font('Arial', 'B', 12)
+        pdf.cell(0, 10, title, 0, 1)
+        pdf.set_font('Arial', 'B', 9)
+        
+        # Calculate column width to fit page (A4 width is 210mm, margins are 10mm)
+        epw = pdf.w - 2 * pdf.l_margin
+        col_width = epw / len(df.columns)
+        row_height = 8
+        
+        # Table Header
+        for col in df.columns:
+            pdf.cell(col_width, row_height, str(col), border=1, align='C')
+        pdf.ln()
+        
+        # Table Rows
+        pdf.set_font('Arial', '', 9)
+        for _, row in df.iterrows():
+            for item in row:
+                pdf.cell(col_width, row_height, str(item), border=1, align='C')
+            pdf.ln()
+        pdf.ln(5)
+
+    # Add the main summary table
+    add_table_to_pdf(summary_df, "Overall Workout Summary")
+    
+    # Add each of the sub-segment tables
+    for segment_name, sub_df in detailed_dfs.items():
+        add_table_to_pdf(sub_df, f"Lap Details: {segment_name}")
+        
+    return pdf.output(dest='S').encode('latin-1')
+
 
 # --- Helper Function to Parse GPX ---
 @st.cache_data
@@ -52,7 +100,6 @@ def parse_gpx(file_bytes):
                 
     df = pd.DataFrame(data)
     
-    # Ensure optional columns exist to prevent KeyErrors
     if 'cad' not in df.columns:
         df['cad'] = np.nan
     if 'hr' not in df.columns:
@@ -64,13 +111,14 @@ def parse_gpx(file_bytes):
     # Calculate speed, smooth over 5 points
     df['speed_m_s'] = df['distance_m'].rolling(5, min_periods=1).sum() / df['time_diff_s'].rolling(5, min_periods=1).sum()
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
-    df.fillna(method='bfill', inplace=True)
+    
+    # Updated Pandas syntax to avoid warnings
+    df.bfill(inplace=True)
     
     return df
 
-# --- Main App UI ---
-st.set_page_config(page_title="Workout Analyzer", layout="wide")
 
+# --- Main App UI ---
 st.title("GPX Workout Analyzer")
 st.markdown("Upload your structured workout data to visualize splits, pace, and heart rate zones.")
 
@@ -84,10 +132,10 @@ if uploaded_file is not None:
     
     if activity_type == "Running":
         df['metric_value'] = 16.666666666667 / df['speed_m_s'] 
-        df.loc[df['metric_value'] > 20, 'metric_value'] = 20 # Cap unreasonable paces
+        df.loc[df['metric_value'] > 20, 'metric_value'] = 20 
         metric_name = "Pace (min/km)"
         if not df['cad'].isna().all():
-            df['cad'] = df['cad'] * 2 # Adjust running half-steps
+            df['cad'] = df['cad'] * 2 
     else:
         df['metric_value'] = df['speed_m_s'] * 3.6
         metric_name = "Speed (km/h)"
@@ -100,7 +148,8 @@ if uploaded_file is not None:
     
     if splits_input:
         try:
-            split_lengths = [float(x.strip()) for x in splits_input.split(',')]
+            # Safer parsing: ignores empty spaces or trailing commas
+            split_lengths = [float(x.strip()) for x in splits_input.split(',') if x.strip()]
             bins = [0] + list(np.cumsum(split_lengths))
             bins.append(float('inf')) 
             
@@ -118,14 +167,19 @@ if uploaded_file is not None:
             
             agg_dict = {
                 'distance_m': lambda x: x.sum() / 1000,
-                'time_diff_s': lambda x: x.sum() / 60,
-                'metric_value': 'mean'
+                'time_diff_s': lambda x: x.sum() / 60
             }
             if has_hr: agg_dict['hr'] = 'mean'
             if has_cad: agg_dict['cad'] = 'mean'
             
             summary = df.groupby('Segment', observed=True).agg(agg_dict).reset_index()
-            summary.rename(columns={'distance_m': 'Distance (km)', 'time_diff_s': 'Time_min', 'metric_value': f'Avg {metric_name}', 'hr': 'Avg HR', 'cad': 'Avg Cadence'}, inplace=True)
+            summary.rename(columns={'distance_m': 'Distance (km)', 'time_diff_s': 'Time_min', 'hr': 'Avg HR', 'cad': 'Avg Cadence'}, inplace=True)
+            
+            # True Pace calculation math fix
+            if activity_type == "Running":
+                summary[f'Avg {metric_name}'] = summary['Time_min'] / summary['Distance (km)']
+            else:
+                summary[f'Avg {metric_name}'] = summary['Distance (km)'] / (summary['Time_min'] / 60)
             
             # Formatting for display
             display_summary = summary.copy()
@@ -150,6 +204,7 @@ if uploaded_file is not None:
             
             # --- Sub-Segment Detailed Splits ---
             st.markdown("### Lap Details")
+            pdf_detailed_dfs = {} # Dictionary to store lap tables for PDF
             
             for segment_name in df['Segment'].dropna().unique():
                 seg_df = df[df['Segment'] == segment_name].copy()
@@ -167,7 +222,13 @@ if uploaded_file is not None:
                     seg_df['Sub_Segment'] = pd.cut(seg_df['local_cum'], bins=sub_bins, labels=sub_labels, right=True)
                     
                     sub_summary = seg_df.groupby('Sub_Segment', observed=True).agg(agg_dict).reset_index()
-                    sub_summary.rename(columns={'distance_m': 'Distance (km)', 'time_diff_s': 'Time_min', 'metric_value': f'Avg {metric_name}', 'hr': 'Avg HR', 'cad': 'Avg Cadence'}, inplace=True)
+                    sub_summary.rename(columns={'distance_m': 'Distance (km)', 'time_diff_s': 'Time_min', 'hr': 'Avg HR', 'cad': 'Avg Cadence'}, inplace=True)
+                    
+                    # True Pace calculation math fix for laps
+                    if activity_type == "Running":
+                        sub_summary[f'Avg {metric_name}'] = sub_summary['Time_min'] / sub_summary['Distance (km)']
+                    else:
+                        sub_summary[f'Avg {metric_name}'] = sub_summary['Distance (km)'] / (sub_summary['Time_min'] / 60)
                     
                     sub_summary['Time'] = sub_summary['Time_min'].apply(format_time)
                     if activity_type == "Running":
@@ -175,7 +236,23 @@ if uploaded_file is not None:
                     else:
                         sub_summary[f'Avg {metric_name}'] = sub_summary[f'Avg {metric_name}'].round(2)
                         
-                    st.dataframe(sub_summary[['Sub_Segment'] + [c for c in display_cols if c != 'Segment']].style.format(format_dict))
+                    final_sub_df = sub_summary[['Sub_Segment'] + [c for c in display_cols if c != 'Segment']]
+                    st.dataframe(final_sub_df.style.format(format_dict))
+                    
+                    # Save the dataframe for the PDF exporter
+                    pdf_detailed_dfs[segment_name] = final_sub_df
+
+            # --- PDF Download Button ---
+            st.markdown("---")
+            pdf_bytes = generate_pdf_report(activity_type, display_summary[display_cols], pdf_detailed_dfs)
+            
+            st.download_button(
+                label="📄 Download Report as PDF",
+                data=pdf_bytes,
+                file_name="workout_report.pdf",
+                mime="application/pdf"
+            )
+            st.markdown("---")
 
             # --- Visualizations ---
             st.markdown("### Telemetry")
@@ -187,7 +264,7 @@ if uploaded_file is not None:
                 )
                 fig_hr.update_traces(mode='lines+markers', marker=dict(size=4))
                 fig_hr.update_layout(title="Heart Rate Profile", margin=dict(t=40, b=0, l=0, r=0))
-                st.plotly_chart(fig_hr, use_container_width=True)
+                st.plotly_chart(fig_hr, width='stretch') # Updated warning fix
             
             col1, col2 = st.columns(2)
             with col1:
@@ -198,7 +275,7 @@ if uploaded_file is not None:
                 fig_metric.update_layout(title=f"{metric_name.split(' ')[0]} Profile", margin=dict(t=40, b=0, l=0, r=0))
                 if activity_type == "Running":
                     fig_metric.update_yaxes(autorange="reversed") 
-                st.plotly_chart(fig_metric, use_container_width=True)
+                st.plotly_chart(fig_metric, width='stretch') # Updated warning fix
                 
             with col2:
                 if has_cad:
@@ -207,9 +284,9 @@ if uploaded_file is not None:
                         labels={target_col: split_method, 'cad': 'Cadence'}
                     )
                     fig_cad.update_layout(title="Cadence Profile", margin=dict(t=40, b=0, l=0, r=0))
-                    st.plotly_chart(fig_cad, use_container_width=True)
+                    st.plotly_chart(fig_cad, width='stretch') # Updated warning fix
                 else:
                     st.info("No cadence data available in this file.")
 
         except Exception as e:
-            st.error("Data processing error. Please verify your interval inputs.")
+            st.error(f"Data processing error. Details: {e}")

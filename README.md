@@ -53,7 +53,7 @@ cd gpx-workout-analyzer
 Make sure **Python 3.9+** is installed.
 
 ```bash
-pip install streamlit gpxpy pandas plotly numpy
+pip install streamlit gpxpy pandas plotly numpy fpdf
 ```
 
 (Optional)
