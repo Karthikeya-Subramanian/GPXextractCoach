@@ -33,9 +33,9 @@ def generate_pdf_report(activity_type, summary_df, detailed_dfs):
     def add_table_to_pdf(df, title):
         pdf.set_font('Arial', 'B', 12)
         pdf.cell(0, 10, title, 0, 1)
-        pdf.set_font('Arial', 'B', 9)
+        pdf.set_font('Arial', 'B', 8) # slightly smaller font to fit new columns
         
-        # Calculate column width to fit page (A4 width is 210mm, margins are 10mm)
+        # Calculate column width to fit page
         epw = pdf.w - 2 * pdf.l_margin
         col_width = epw / len(df.columns)
         row_height = 8
@@ -46,7 +46,7 @@ def generate_pdf_report(activity_type, summary_df, detailed_dfs):
         pdf.ln()
         
         # Table Rows
-        pdf.set_font('Arial', '', 9)
+        pdf.set_font('Arial', '', 8)
         for _, row in df.iterrows():
             for item in row:
                 pdf.cell(col_width, row_height, str(item), border=1, align='C')
@@ -76,7 +76,6 @@ def parse_gpx(file_bytes):
                     'time': point.time,
                     'lat': point.latitude,
                     'lon': point.longitude,
-                    # Handle None elevation safely
                     'elevation': point.elevation if point.elevation is not None else 0.0,
                 }
                 
@@ -101,7 +100,6 @@ def parse_gpx(file_bytes):
                 
     df = pd.DataFrame(data)
     
-    # Calculate point-to-point elevation difference and isolate positive gains
     df['ele_diff'] = df['elevation'].diff().fillna(0)
     df['ele_gain'] = df['ele_diff'].clip(lower=0)
     
@@ -113,10 +111,8 @@ def parse_gpx(file_bytes):
     df['cum_distance_km'] = df['distance_m'].cumsum() / 1000
     df['cum_time_min'] = df['time_diff_s'].cumsum() / 60
     
-    # Calculate speed, smooth over 5 points
     df['speed_m_s'] = df['distance_m'].rolling(5, min_periods=1).sum() / df['time_diff_s'].rolling(5, min_periods=1).sum()
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
-    
     df.bfill(inplace=True)
     
     return df
@@ -124,7 +120,7 @@ def parse_gpx(file_bytes):
 
 # --- Main App UI ---
 st.title("GPX Workout Analyzer")
-st.markdown("Upload your structured workout data to visualize splits, pace, heart rate zones, and elevation.")
+st.markdown("Upload your structured workout data to visualize splits, pace, heart rate zones, and power/elevation metrics.")
 
 uploaded_file = st.file_uploader("Select GPX File", type=["gpx"])
 
@@ -138,11 +134,31 @@ if uploaded_file is not None:
         df['metric_value'] = 16.666666666667 / df['speed_m_s'] 
         df.loc[df['metric_value'] > 20, 'metric_value'] = 20 
         metric_name = "Pace (min/km)"
+        
         if not df['cad'].isna().all():
             df['cad'] = df['cad'] * 2 
-    else:
+            df['stride_length_m'] = np.where(df['cad'] > 0, (df['speed_m_s'] * 60) / df['cad'], 0)
+            
+    else: # Cycling
         df['metric_value'] = df['speed_m_s'] * 3.6
         metric_name = "Speed (km/h)"
+        
+        st.sidebar.subheader("Power Estimation Metrics")
+        mass = st.sidebar.number_input("Rider + Bike Weight (kg)", value=80.0)
+        Crr = st.sidebar.number_input("Rolling Resistance (Crr)", value=0.008, format="%.3f", help="0.005=Smooth, 0.007=Rough, 0.009=Broken")
+        CdA = st.sidebar.number_input("Aero Drag (CdA)", value=0.38, format="%.2f", help="0.32=Road Drops, 0.45=Upright")
+        rho = st.sidebar.number_input("Air Density (kg/m^3)", value=1.11, format="%.2f", help="1.22=Sea Level, 1.08=Bangalore")
+        
+        g = 9.81
+        grade_decimal = df['ele_diff'] / df['distance_m']
+        grade_decimal = grade_decimal.replace([np.inf, -np.inf], 0).fillna(0)
+        v = df['speed_m_s']
+        
+        F_gravity = mass * g * grade_decimal
+        F_rolling = mass * g * Crr
+        F_drag = 0.5 * rho * CdA * (v ** 2)
+        raw_power = (F_gravity + F_rolling + F_drag) * v
+        df['watts'] = raw_power.clip(lower=0)
 
     st.sidebar.subheader("Interval Segmentation")
     split_method = st.sidebar.selectbox("Segment Metric", ["Distance (km)", "Time (minutes)"])
@@ -152,7 +168,6 @@ if uploaded_file is not None:
     
     if splits_input:
         try:
-            # Safer parsing: ignores empty spaces or trailing commas
             split_lengths = [float(x.strip()) for x in splits_input.split(',') if x.strip()]
             bins = [0] + list(np.cumsum(split_lengths))
             bins.append(float('inf')) 
@@ -165,6 +180,8 @@ if uploaded_file is not None:
             
             has_hr = not df['hr'].isna().all()
             has_cad = not df['cad'].isna().all()
+            has_stride = 'stride_length_m' in df.columns
+            has_watts = 'watts' in df.columns
             
             # --- Aggregation Dictionary ---
             agg_dict = {
@@ -175,14 +192,15 @@ if uploaded_file is not None:
             }
             if has_hr: agg_dict['hr'] = 'mean'
             if has_cad: agg_dict['cad'] = 'mean'
+            if has_stride: agg_dict['stride_length_m'] = 'mean'
+            if has_watts: agg_dict['watts'] = 'mean'
             
             # --- Workout Summary Table ---
             st.markdown("### Overview")
             
             summary = df.groupby('Segment', observed=True).agg(agg_dict).reset_index()
-            summary.rename(columns={'distance_m': 'Distance (km)', 'time_diff_s': 'Time_min', 'hr': 'Avg HR', 'cad': 'Avg Cadence'}, inplace=True)
+            summary.rename(columns={'distance_m': 'Distance (km)', 'time_diff_s': 'Time_min'}, inplace=True)
             
-            # Calculate metrics
             if activity_type == "Running":
                 summary[f'Avg {metric_name}'] = summary['Time_min'] / summary['Distance (km)']
             else:
@@ -192,10 +210,9 @@ if uploaded_file is not None:
                                               (summary['ele_diff'] / (summary['Distance (km)'] * 1000)) * 100, 0)
             summary['Elev Gain (m)'] = summary['ele_gain']
             
-            # Formatting for display and PDF (Hardcoding 2 decimals to strings)
+            # Formatting Summary Table
             display_summary = summary.copy()
             display_summary['Time'] = display_summary['Time_min'].apply(format_time)
-            
             display_summary['Distance (km)'] = display_summary['Distance (km)'].map('{:.2f}'.format)
             display_summary['Elev Gain (m)'] = display_summary['Elev Gain (m)'].map('{:.2f}'.format)
             display_summary['Gradient (%)'] = summary['Gradient (%)'].map('{:.2f}'.format) + '%'
@@ -208,13 +225,18 @@ if uploaded_file is not None:
             display_cols = ['Segment', 'Distance (km)', 'Time', f'Avg {metric_name}', 'Elev Gain (m)', 'Gradient (%)']
             
             if has_hr:
-                display_summary['Avg HR'] = summary['Avg HR'].map('{:.2f}'.format)
+                display_summary['Avg HR'] = summary['hr'].map('{:.0f}'.format)
                 display_cols.append('Avg HR')
             if has_cad:
-                display_summary['Avg Cadence'] = summary['Avg Cadence'].map('{:.2f}'.format)
+                display_summary['Avg Cadence'] = summary['cad'].map('{:.0f}'.format)
                 display_cols.append('Avg Cadence')
+            if has_stride:
+                display_summary['Avg Stride (m)'] = summary['stride_length_m'].map('{:.2f}'.format)
+                display_cols.append('Avg Stride (m)')
+            if has_watts:
+                display_summary['Avg Power (W)'] = summary['watts'].map('{:.0f}'.format)
+                display_cols.append('Avg Power (W)')
                 
-            # No style.format needed anymore!
             st.dataframe(display_summary[display_cols])
             
             # --- Sub-Segment Detailed Splits ---
@@ -237,7 +259,7 @@ if uploaded_file is not None:
                     seg_df['Sub_Segment'] = pd.cut(seg_df['local_cum'], bins=sub_bins, labels=sub_labels, right=True)
                     
                     sub_summary = seg_df.groupby('Sub_Segment', observed=True).agg(agg_dict).reset_index()
-                    sub_summary.rename(columns={'distance_m': 'Distance (km)', 'time_diff_s': 'Time_min', 'hr': 'Avg HR', 'cad': 'Avg Cadence'}, inplace=True)
+                    sub_summary.rename(columns={'distance_m': 'Distance (km)', 'time_diff_s': 'Time_min'}, inplace=True)
                     
                     if activity_type == "Running":
                         sub_summary[f'Avg {metric_name}'] = sub_summary['Time_min'] / sub_summary['Distance (km)']
@@ -248,7 +270,7 @@ if uploaded_file is not None:
                                                           (sub_summary['ele_diff'] / (sub_summary['Distance (km)'] * 1000)) * 100, 0)
                     sub_summary['Elev Gain (m)'] = sub_summary['ele_gain']
 
-                    # Hardcoding 2 decimals to strings for Laps
+                    # Formatting Sub-Segment Table
                     sub_summary['Time'] = sub_summary['Time_min'].apply(format_time)
                     sub_summary['Distance (km)'] = sub_summary['Distance (km)'].map('{:.2f}'.format)
                     sub_summary['Elev Gain (m)'] = sub_summary['Elev Gain (m)'].map('{:.2f}'.format)
@@ -260,9 +282,13 @@ if uploaded_file is not None:
                         sub_summary[f'Avg {metric_name}'] = sub_summary[f'Avg {metric_name}'].map('{:.2f}'.format)
                         
                     if has_hr:
-                        sub_summary['Avg HR'] = sub_summary['Avg HR'].map('{:.2f}'.format)
+                        sub_summary['Avg HR'] = sub_summary['hr'].map('{:.0f}'.format)
                     if has_cad:
-                        sub_summary['Avg Cadence'] = sub_summary['Avg Cadence'].map('{:.2f}'.format)
+                        sub_summary['Avg Cadence'] = sub_summary['cad'].map('{:.0f}'.format)
+                    if has_stride:
+                        sub_summary['Avg Stride (m)'] = sub_summary['stride_length_m'].map('{:.2f}'.format)
+                    if has_watts:
+                        sub_summary['Avg Power (W)'] = sub_summary['watts'].map('{:.0f}'.format)
                         
                     final_sub_df = sub_summary[['Sub_Segment'] + [c for c in display_cols if c != 'Segment']]
                     st.dataframe(final_sub_df)
@@ -306,7 +332,14 @@ if uploaded_file is not None:
                 st.plotly_chart(fig_metric, width='stretch')
                 
             with col2:
-                if has_cad:
+                if has_watts: # Cycling Watts graph
+                    fig_watts = px.line(
+                        df, x=target_col, y='watts', color='Segment',
+                        labels={target_col: split_method, 'watts': 'Estimated Power (W)'}
+                    )
+                    fig_watts.update_layout(title="Power Profile", margin=dict(t=40, b=0, l=0, r=0))
+                    st.plotly_chart(fig_watts, width='stretch')
+                elif has_cad: # Running Cadence graph
                     fig_cad = px.line(
                         df, x=target_col, y='cad', color='Segment',
                         labels={target_col: split_method, 'cad': 'Cadence'}
@@ -314,7 +347,7 @@ if uploaded_file is not None:
                     fig_cad.update_layout(title="Cadence Profile", margin=dict(t=40, b=0, l=0, r=0))
                     st.plotly_chart(fig_cad, width='stretch')
                 else:
-                    st.info("No cadence data available in this file.")
+                    st.info("No cadence or power data available to chart.")
 
         except Exception as e:
             st.error(f"Data processing error. Details: {e}")
