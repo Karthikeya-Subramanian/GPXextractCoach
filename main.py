@@ -66,7 +66,6 @@ def parse_gpx(file_bytes):
         for segment in track.segments:
             for i, point in enumerate(segment.points):
                 row = {
-                    'time': point.time,
                     'lat': point.latitude,
                     'lon': point.longitude,
                     'elevation': point.elevation if point.elevation is not None else 0.0,
@@ -86,8 +85,12 @@ def parse_gpx(file_bytes):
                 else:
                     prev_point = segment.points[i-1]
                     row['distance_m'] = point.distance_2d(prev_point)
-                    row['time_diff_s'] = (point.time - prev_point.time).total_seconds()
                     
+                    if point.time is not None and prev_point.time is not None:
+                        row['time_diff_s'] = (point.time - prev_point.time).total_seconds()
+                    else:
+                        row['time_diff_s'] = 0.0
+                        
                 data.append(row)
                 
     df = pd.DataFrame(data)
@@ -101,7 +104,10 @@ def parse_gpx(file_bytes):
     df['cum_distance_km'] = df['distance_m'].cumsum() / 1000
     df['cum_time_min'] = df['time_diff_s'].cumsum() / 60
     
-    df['speed_m_s'] = df['distance_m'].rolling(5, min_periods=1).sum() / df['time_diff_s'].rolling(5, min_periods=1).sum()
+    sum_dist = df['distance_m'].rolling(5, min_periods=1).sum()
+    sum_time = df['time_diff_s'].rolling(5, min_periods=1).sum()
+    df['speed_m_s'] = np.where(sum_time > 0, sum_dist / sum_time, 0.0)
+    
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.bfill(inplace=True)
     
@@ -109,18 +115,38 @@ def parse_gpx(file_bytes):
 
 # --- Main App UI ---
 st.title("GPX Workout Analyzer")
-st.markdown("Upload your structured workout data to visualize splits, pace, heart rate zones, and power/elevation metrics.")
+st.markdown("Upload your structured workout data to visualize splits, pace, heart rate, and power/elevation metrics.")
 
 uploaded_file = st.file_uploader("Select GPX File", type=["gpx"])
 
 if uploaded_file is not None:
     df = parse_gpx(uploaded_file.getvalue())
+    is_route = df['time_diff_s'].sum() == 0
     
     st.sidebar.header("Configuration")
     activity_type = st.sidebar.radio("Activity Profile", ["Running", "Cycling"])
     
+    st.sidebar.subheader("Athlete Profile")
+    user_weight = st.sidebar.number_input("Body Weight (kg)", value=70.0, step=1.0)
+    
+    if is_route:
+        st.sidebar.markdown("---")
+        st.warning("🗺️ **Planning Mode Active:** This file is a Route and lacks timestamps. Enter your target pace/speed below to generate estimated split times and power output.")
+        
+        if activity_type == "Running":
+            target_pace = st.sidebar.number_input("Target Pace (min/km)", value=4.00, step=0.1)
+            target_speed_m_s = 1000 / (target_pace * 60)
+        else:
+            target_speed_kmh = st.sidebar.number_input("Target Speed (km/h)", value=30.0, step=1.0)
+            target_speed_m_s = target_speed_kmh / 3.6
+            
+        df['time_diff_s'] = np.where(df['distance_m'] > 0, df['distance_m'] / target_speed_m_s, 0.0)
+        df['cum_time_min'] = df['time_diff_s'].cumsum() / 60
+        df['speed_m_s'] = np.where(df['distance_m'] > 0, target_speed_m_s, 0.0)
+    
+    # --- METRICS LOGIC ---
     if activity_type == "Running":
-        df['metric_value'] = 16.666666666667 / df['speed_m_s'] 
+        df['metric_value'] = np.where(df['speed_m_s'] > 0, 16.666666666667 / df['speed_m_s'], 0.0)
         df.loc[df['metric_value'] > 20, 'metric_value'] = 20 
         metric_name = "Pace (min/km)"
         
@@ -132,8 +158,10 @@ if uploaded_file is not None:
         df['metric_value'] = df['speed_m_s'] * 3.6
         metric_name = "Speed (km/h)"
         
-        st.sidebar.subheader("Power Estimation Metrics")
-        mass = st.sidebar.number_input("Rider + Bike Weight (kg)", value=80.0)
+        st.sidebar.subheader("Equipment (Cycling)")
+        bike_weight = st.sidebar.number_input("Bike Weight (kg)", value=10.0, step=0.5)
+        total_mass = user_weight + bike_weight
+        
         Crr = st.sidebar.number_input("Rolling Resistance (Crr)", value=0.008, format="%.3f")
         CdA = st.sidebar.number_input("Aero Drag (CdA)", value=0.38, format="%.2f")
         rho = st.sidebar.number_input("Air Density (kg/m^3)", value=1.11, format="%.2f")
@@ -143,30 +171,24 @@ if uploaded_file is not None:
         grade_decimal = grade_decimal.replace([np.inf, -np.inf], 0).fillna(0)
         v = df['speed_m_s']
         
-        F_gravity = mass * g * grade_decimal
-        F_rolling = mass * g * Crr
+        F_gravity = total_mass * g * grade_decimal
+        F_rolling = total_mass * g * Crr
         F_drag = 0.5 * rho * CdA * (v ** 2)
         raw_power = (F_gravity + F_rolling + F_drag) * v
         df['watts'] = raw_power.clip(lower=0)
 
     st.sidebar.subheader("Interval Segmentation")
     split_method = st.sidebar.selectbox("Segment Metric", ["Distance (km)", "Time (minutes)"])
-    
-    # Updated to show the new multiplier syntax
     placeholder = "3, 10x0.4, 3" if split_method == "Distance (km)" else "3, 5, 1, 5, 1, 3"
     splits_input = st.sidebar.text_input("Major Intervals (comma separated, use 'x' for repeats)", placeholder)
     
-    # New option for decimal sub-lap resolution
     sub_lap_size = st.sidebar.number_input(
         f"Lap Details Resolution ({split_method.split(' ')[0]})", 
-        value=0.4 if split_method == "Distance (km)" else 1.0, 
-        step=0.1, 
-        min_value=0.05
+        value=0.4 if split_method == "Distance (km)" else 1.0, step=0.1, min_value=0.05
     )
     
     if splits_input:
         try:
-            # New Parser: Allows "10x0.4" to create ten 400m splits instantly
             split_lengths = []
             for x in splits_input.split(','):
                 x = x.strip()
@@ -183,7 +205,6 @@ if uploaded_file is not None:
             labels = [f"Split {i+1} ({val})" for i, val in enumerate(split_lengths)] + ["Remaining"]
             target_col = 'cum_distance_km' if split_method == "Distance (km)" else 'cum_time_min'
             
-            # include_lowest=True fixes dropping the first GPS ping
             df['Segment'] = pd.cut(df[target_col], bins=bins, labels=labels, right=True, include_lowest=True)
             df = df[df['Segment'].notna()]
             
@@ -192,6 +213,53 @@ if uploaded_file is not None:
             has_stride = 'stride_length_m' in df.columns
             has_watts = 'watts' in df.columns
             
+            # --- OVERALL STATS CALCULATIONS ---
+            total_dist = df['distance_m'].sum() / 1000
+            total_time = df['time_diff_s'].sum() / 60
+            
+            # Calorie Calculation
+            if activity_type == "Running":
+                total_calories = user_weight * total_dist * 1.036
+            else:
+                if has_watts:
+                    total_joules = (df['watts'] * df['time_diff_s']).sum()
+                    total_calories = total_joules / 1000
+                else:
+                    total_calories = 10.0 * user_weight * (total_time / 60)
+            
+            # --- TOP METRICS DASHBOARD ---
+            st.markdown("---")
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Total Distance", f"{total_dist:.2f} km")
+            col2.metric("Total Time", format_time(total_time))
+            col3.metric("Calories Burned", f"{int(total_calories)} kcal")
+            st.markdown("---")
+
+            # --- GPS ROUTE MAP (THIN & COLOR CODED) ---
+            st.markdown("### GPS Route")
+            valid_coords = df.dropna(subset=['lat', 'lon']).copy()
+            if not valid_coords.empty:
+                if activity_type == "Running":
+                    valid_coords['color_metric'] = valid_coords['metric_value'].clip(upper=10)
+                    color_scale = 'Viridis_r'
+                else:
+                    valid_coords['color_metric'] = valid_coords['metric_value']
+                    color_scale = 'Viridis'
+
+                fig_map = px.scatter_mapbox(
+                    valid_coords, 
+                    lat="lat", lon="lon", 
+                    color='color_metric',
+                    color_continuous_scale=color_scale,
+                    zoom=13,
+                    mapbox_style="carto-positron",
+                    labels={'color_metric': metric_name}
+                )
+                fig_map.update_traces(marker=dict(size=2, opacity=0.8))
+                fig_map.update_layout(margin={"r":0,"t":0,"l":0,"b":0})
+                st.plotly_chart(fig_map, width='stretch')
+
+
             agg_dict = {
                 'distance_m': lambda x: x.sum() / 1000,
                 'time_diff_s': lambda x: x.sum() / 60,
@@ -209,7 +277,6 @@ if uploaded_file is not None:
             summary = df.groupby('Segment', observed=True).agg(agg_dict).reset_index()
             summary.rename(columns={'distance_m': 'Distance (km)', 'time_diff_s': 'Time_min'}, inplace=True)
             
-            # Math safe True Pace division
             if activity_type == "Running":
                 summary[f'Avg {metric_name}'] = np.where(summary['Distance (km)'] > 0, summary['Time_min'] / summary['Distance (km)'], 0.0)
             else:
@@ -219,7 +286,10 @@ if uploaded_file is not None:
                                               (summary['ele_diff'] / (summary['Distance (km)'] * 1000)) * 100, 0)
             summary['Elev Gain (m)'] = summary['ele_gain']
             
+            raw_metric_col = f'Avg {metric_name} (Raw)'
             display_summary = summary.copy()
+            display_summary[raw_metric_col] = display_summary[f'Avg {metric_name}']
+            
             display_summary['Time'] = display_summary['Time_min'].apply(format_time)
             display_summary['Distance (km)'] = display_summary['Distance (km)'].map('{:.2f}'.format)
             display_summary['Elev Gain (m)'] = display_summary['Elev Gain (m)'].map('{:.2f}'.format)
@@ -245,8 +315,34 @@ if uploaded_file is not None:
                 display_summary['Avg Power (W)'] = summary['watts'].map('{:.0f}'.format)
                 display_cols.append('Avg Power (W)')
                 
-            st.dataframe(display_summary[display_cols])
+            cmap = 'Greens_r' if activity_type == "Running" else 'Greens'
+            styled_summary = display_summary[display_cols + [raw_metric_col]].style.background_gradient(
+                subset=[raw_metric_col], cmap=cmap
+            ).hide(axis="columns", subset=[raw_metric_col])
             
+            st.dataframe(styled_summary)
+            
+            # --- Split Visualization Bar Chart ---
+            y_col = 'Time_min' if split_method == "Distance (km)" else 'Distance (km)'
+            y_label = "Time (Minutes)" if split_method == "Distance (km)" else "Distance (km)"
+            bar_text = display_summary['Time'] if split_method == "Distance (km)" else display_summary['Distance (km)'] + ' km'
+            
+            fig_bar = px.bar(
+                summary, 
+                x='Segment', 
+                y=y_col,
+                color=f'Avg {metric_name}',
+                text=bar_text,
+                title=f"Workout Structure ({y_label} per Split)",
+                color_continuous_scale=px.colors.sequential.Viridis
+            )
+            
+            if activity_type == "Running":
+                fig_bar.update_coloraxes(reversescale=True)
+
+            fig_bar.update_traces(textposition="outside", cliponaxis=False)
+            st.plotly_chart(fig_bar, width='stretch')
+
             # --- Sub-Segment Detailed Splits ---
             st.markdown("### Lap Details")
             pdf_detailed_dfs = {}
@@ -260,12 +356,11 @@ if uploaded_file is not None:
                     seg_df['local_cum'] = seg_df[target_col] - seg_df[target_col].iloc[0]
                     max_local = seg_df['local_cum'].max()
                     
-                    # New Decimal-Safe Binning Logic
                     num_laps = int(np.ceil(max_local / sub_lap_size))
                     if num_laps == 0: num_laps = 1
                     
                     sub_bins = [i * sub_lap_size for i in range(num_laps + 1)]
-                    sub_bins[-1] = max(sub_bins[-1], max_local + 1.0) # Ensure last ping is caught
+                    sub_bins[-1] = max(sub_bins[-1], max_local + 1.0) 
                     
                     sub_labels = [f"Lap {i+1}" for i in range(len(sub_bins)-1)]
                     seg_df['Sub_Segment'] = pd.cut(seg_df['local_cum'], bins=sub_bins, labels=sub_labels, right=True, include_lowest=True)
@@ -273,7 +368,6 @@ if uploaded_file is not None:
                     sub_summary = seg_df.groupby('Sub_Segment', observed=True).agg(agg_dict).reset_index()
                     sub_summary.rename(columns={'distance_m': 'Distance (km)', 'time_diff_s': 'Time_min'}, inplace=True)
                     
-                    # Math safe True Pace division
                     if activity_type == "Running":
                         sub_summary[f'Avg {metric_name}'] = np.where(sub_summary['Distance (km)'] > 0, sub_summary['Time_min'] / sub_summary['Distance (km)'], 0.0)
                     else:
@@ -282,6 +376,8 @@ if uploaded_file is not None:
                     sub_summary['Gradient (%)'] = np.where(sub_summary['Distance (km)'] > 0, 
                                                           (sub_summary['ele_diff'] / (sub_summary['Distance (km)'] * 1000)) * 100, 0)
                     sub_summary['Elev Gain (m)'] = sub_summary['ele_gain']
+                    
+                    sub_summary[raw_metric_col] = sub_summary[f'Avg {metric_name}']
 
                     sub_summary['Time'] = sub_summary['Time_min'].apply(format_time)
                     sub_summary['Distance (km)'] = sub_summary['Distance (km)'].map('{:.2f}'.format)
@@ -303,8 +399,12 @@ if uploaded_file is not None:
                         sub_summary['Avg Power (W)'] = sub_summary['watts'].map('{:.0f}'.format)
                         
                     final_sub_df = sub_summary[['Sub_Segment'] + [c for c in display_cols if c != 'Segment']]
-                    st.dataframe(final_sub_df)
                     
+                    styled_sub_df = sub_summary[['Sub_Segment'] + [c for c in display_cols if c != 'Segment'] + [raw_metric_col]].style.background_gradient(
+                        subset=[raw_metric_col], cmap=cmap
+                    ).hide(axis="columns", subset=[raw_metric_col])
+                    
+                    st.dataframe(styled_sub_df)
                     pdf_detailed_dfs[segment_name] = final_sub_df
 
             # --- PDF Download Button ---
@@ -323,6 +423,7 @@ if uploaded_file is not None:
             st.markdown("### Telemetry")
             
             if has_hr:
+                # Standard HR Line Chart
                 fig_hr = px.scatter(
                     df, x=target_col, y='hr', color='Segment',
                     labels={target_col: split_method, 'hr': 'Heart Rate (bpm)'}
