@@ -184,7 +184,7 @@ if uploaded_file is not None:
     
     sub_lap_size = st.sidebar.number_input(
         f"Lap Details Resolution ({split_method.split(' ')[0]})", 
-        value=1 if split_method == "Distance (km)" else 1.0, step=0.1, min_value=0.05
+        value=0.4 if split_method == "Distance (km)" else 1.0, step=0.1, min_value=0.05
     )
     
     if splits_input:
