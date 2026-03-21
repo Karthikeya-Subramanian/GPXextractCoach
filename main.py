@@ -127,7 +127,7 @@ if uploaded_file is not None:
     activity_type = st.sidebar.radio("Activity Profile", ["Running", "Cycling"])
     
     st.sidebar.subheader("Athlete Profile")
-    user_weight = st.sidebar.number_input("Body Weight (kg)", value=70.0, step=1.0)
+    user_weight = st.sidebar.number_input("Body Weight (kg)", value=61.0, step=1.0)
     
     if is_route:
         st.sidebar.markdown("---")
@@ -159,7 +159,7 @@ if uploaded_file is not None:
         metric_name = "Speed (km/h)"
         
         st.sidebar.subheader("Equipment (Cycling)")
-        bike_weight = st.sidebar.number_input("Bike Weight (kg)", value=10.0, step=0.5)
+        bike_weight = st.sidebar.number_input("Bike Weight (kg)", value=17.0, step=0.5)
         total_mass = user_weight + bike_weight
         
         Crr = st.sidebar.number_input("Rolling Resistance (Crr)", value=0.008, format="%.3f")
@@ -179,12 +179,12 @@ if uploaded_file is not None:
 
     st.sidebar.subheader("Interval Segmentation")
     split_method = st.sidebar.selectbox("Segment Metric", ["Distance (km)", "Time (minutes)"])
-    placeholder = "3, 10x0.4, 3" if split_method == "Distance (km)" else "3, 5, 1, 5, 1, 3"
+    placeholder = "10" if split_method == "Distance (km)" else "3, 5, 1, 5, 1, 3"
     splits_input = st.sidebar.text_input("Major Intervals (comma separated, use 'x' for repeats)", placeholder)
     
     sub_lap_size = st.sidebar.number_input(
         f"Lap Details Resolution ({split_method.split(' ')[0]})", 
-        value=0.4 if split_method == "Distance (km)" else 1.0, step=0.1, min_value=0.05
+        value=1 if split_method == "Distance (km)" else 1.0, step=0.1, min_value=0.05
     )
     
     if splits_input:
