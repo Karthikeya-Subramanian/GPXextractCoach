@@ -461,7 +461,7 @@ if uploaded_file is not None:
                         labels={target_col: split_method, 'cad': 'Cadence'}
                     )
                     fig_cad.update_layout(title="Cadence Profile", margin=dict(t=40, b=0, l=0, r=0))
-                    st.plotly_chart(fig_cad, width='stretch')f
+                    st.plotly_chart(fig_cad, width='stretch')
                 else:
                     st.info("No cadence or power data available to chart.")
 
