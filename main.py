@@ -411,10 +411,14 @@ if uploaded_file is not None:
             st.markdown("---")
             pdf_bytes = generate_pdf_report(activity_type, display_summary[display_cols], pdf_detailed_dfs)
             
+            # Extract the original file name and swap the extension
+            original_name = uploaded_file.name.rsplit('.', 1)[0]
+            pdf_filename = f"{original_name}_report.pdf"
+            
             st.download_button(
                 label="📄 Download Report as PDF",
                 data=pdf_bytes,
-                file_name="workout_report.pdf",
+                file_name=pdf_filename,
                 mime="application/pdf"
             )
             st.markdown("---")
@@ -457,7 +461,7 @@ if uploaded_file is not None:
                         labels={target_col: split_method, 'cad': 'Cadence'}
                     )
                     fig_cad.update_layout(title="Cadence Profile", margin=dict(t=40, b=0, l=0, r=0))
-                    st.plotly_chart(fig_cad, width='stretch')
+                    st.plotly_chart(fig_cad, width='stretch')f
                 else:
                     st.info("No cadence or power data available to chart.")
 
